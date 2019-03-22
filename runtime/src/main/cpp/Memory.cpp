@@ -83,6 +83,10 @@ typedef KStdVector<KRef*> KRefPtrList;
 
 struct FrameOverlay {
   ArenaContainer* arena;
+  FrameOverlay* previous;
+  // As they go in pair, sizeof(FrameOverlay) % sizeof(void*) == 0 is always held.
+  int32_t parameters;
+  int32_t count;
 };
 
 // A little hack that allows to enable -O2 optimizations
@@ -299,6 +303,10 @@ struct MemoryState {
   size_t gcThreshold;
   // If collection is in progress.
   bool gcInProgress;
+  // Current frame pointer.
+  FrameOverlay* currentFrame;
+  // Objects to be released.
+  ContainerHeaderList* toRelease;
 
 #if GC_ERGONOMICS
   uint64_t lastGcTimestamp;
@@ -607,16 +615,15 @@ inline void DecrementRC(ContainerHeader* container) {
   }
 }
 
+template <bool Atomic, bool UseCycleCollector>
+inline void EnqueueDecrementRC(ContainerHeader* container) {
+   RuntimeCheck(false, "Unsupported");
+}
+
 #else // USE_GC
 
 inline uint32_t freeableSize(MemoryState* state) {
   return state->toFree->size();
-}
-
-template <bool Atomic>
-inline void IncrementRC(ContainerHeader* container) {
-  container->incRefCount<Atomic>();
-  container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
 }
 
 template <bool Atomic, bool UseCycleCollector>
@@ -642,6 +649,40 @@ inline void DecrementRC(ContainerHeader* container) {
         }
       }
     }
+  }
+}
+
+inline void DecrementRC(ContainerHeader* container) {
+  bool atomic = container->shareable();
+  bool useCycleCollector = container->tag() == CONTAINER_TAG_NORMAL;
+  if (atomic) {
+    if (container->decRefCount<true>() == 0) {
+      FreeContainer(container);
+    } else if (useCycleCollector) {
+      RuntimeAssert(!atomic, "Cycle collector shalln't be used with shared objects yet");
+      RuntimeAssert(container->objectCount() == 1,
+        "cycle collector shall only work with single object containers");
+      // We do not use cycle collector for frozen objects, as we already detected
+      // possible cycles during freezing.
+      // Also do not use cycle collector for provable acyclic objects.
+      int color = container->color();
+      if (color != CONTAINER_TAG_GC_PURPLE && color != CONTAINER_TAG_GC_GREEN) {
+        container->setColorAssertIfGreen(CONTAINER_TAG_GC_PURPLE);
+        if (!container->buffered()) {
+          container->setBuffered();
+          memoryState->toFree->push_back(container);
+        }
+      }
+    }
+  }
+}
+
+template <bool Atomic, bool UseCycleCollector>
+inline void EnqueueDecrementRC(ContainerHeader* container) {
+  auto state = memoryState;
+  state->toRelease->push_back(container);
+  if (state->toRelease->size() > 16384 && state->gcSuspendCount == 0) {
+    GarbageCollect();
   }
 }
 
@@ -893,10 +934,9 @@ inline bool canBeCyclic(ContainerHeader* container) {
   return true;
 }
 
-ALWAYS_INLINE inline void addRef(ContainerHeader* container) {
-  // Looking at container type we may want to skip AddRef() totally
-  // (non-escaping stack objects, constant objects).
-  switch (container->refCount_ & CONTAINER_TAG_MASK) {
+ALWAYS_INLINE inline void AddHeapRef(ContainerHeader* container) {
+  UPDATE_ADDREF_STAT(memoryState, container, needAtomicAccess(container), 0)
+  switch (container->tag()) {
     case CONTAINER_TAG_STACK:
       break;
     case CONTAINER_TAG_NORMAL:
@@ -909,11 +949,6 @@ ALWAYS_INLINE inline void addRef(ContainerHeader* container) {
   }
 }
 
-ALWAYS_INLINE inline void AddHeapRef(ContainerHeader* container) {
-  UPDATE_ADDREF_STAT(memoryState, container, needAtomicAccess(container), 0);
-  addRef(container);
-}
-
 ALWAYS_INLINE inline void AddHeapRef(ObjHeader* header) {
   auto* container = header->container();
   if (container != nullptr) AddHeapRef(container);
@@ -921,7 +956,15 @@ ALWAYS_INLINE inline void AddHeapRef(ObjHeader* header) {
 
 ALWAYS_INLINE inline void AddStackRef(ContainerHeader* container) {
   UPDATE_ADDREF_STAT(memoryState, container, needAtomicAccess(container), 1);
-  addRef(container);
+  switch (container->tag()) {
+    case CONTAINER_TAG_STACK:
+    case CONTAINER_TAG_NORMAL:
+      break;
+    /* case CONTAINER_TAG_FROZEN: case CONTAINER_TAG_ATOMIC: */
+    default:
+      IncrementRC</* Atomic = */ true>(container);
+      break;
+  }
 }
 
 ALWAYS_INLINE inline void AddStackRef(ObjHeader* header) {
@@ -929,30 +972,32 @@ ALWAYS_INLINE inline void AddStackRef(ObjHeader* header) {
   if (container != nullptr) AddStackRef(container);
 }
 
-ALWAYS_INLINE inline void releaseRef(ContainerHeader* header) {
-  // Looking at container type we may want to skip ReleaseRef() totally
-  // (non-escaping stack objects, constant objects).
-  switch (header->tag()) {
-    case CONTAINER_TAG_STACK:
-      break;
-    case CONTAINER_TAG_NORMAL:
-      DecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true>(header);
-      break;
-    /* case CONTAINER_TAG_FROZEN: case CONTAINER_TAG_ATOMIC: */
-    default:
-      DecrementRC</* Atomic = */ true, /* UseCyclicCollector = */ false>(header);
-      break;
-  }
-}
-
 ALWAYS_INLINE inline void ReleaseHeapRef(ContainerHeader* container) {
-  UPDATE_RELEASEREF_STAT(memoryState, container, needAtomicAccess(container), canBeCyclic(container), 0);
-  releaseRef(container);
+  UPDATE_RELEASEREF_STAT(memoryState, container, needAtomicAccess(container), canBeCyclic(container), 0)
+  switch (container->tag()) {
+      case CONTAINER_TAG_STACK:
+        break;
+      case CONTAINER_TAG_NORMAL:
+        EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true>(container);
+        break;
+      /* case CONTAINER_TAG_FROZEN: case CONTAINER_TAG_ATOMIC: */
+      default:
+        DecrementRC</* Atomic = */ true, /* UseCyclicCollector = */ false>(container);
+        break;
+    }
 }
 
 ALWAYS_INLINE inline void ReleaseStackRef(ContainerHeader* container) {
   UPDATE_RELEASEREF_STAT(memoryState, container, needAtomicAccess(container), canBeCyclic(container), 1);
-  releaseRef(container);
+  switch (container->tag()) {
+    case CONTAINER_TAG_STACK:
+    case CONTAINER_TAG_NORMAL:
+      break;
+    /* case CONTAINER_TAG_FROZEN: case CONTAINER_TAG_ATOMIC: */
+    default:
+      DecrementRC</* Atomic = */ true, /* UseCyclicCollector = */ false>(container);
+      break;
+  }
 }
 
 ALWAYS_INLINE inline void ReleaseHeapRef(ObjHeader* header) {
@@ -986,8 +1031,7 @@ inline size_t containerSize(const ContainerHeader* container) {
   for (int object = 0; object < container->objectCount(); object++) {
     size_t size = objectSize(obj);
     result += size;
-    obj = reinterpret_cast<ObjHeader*>(
-        reinterpret_cast<uintptr_t>(obj) + size);
+    obj = reinterpret_cast<ObjHeader*>(reinterpret_cast<uintptr_t>(obj) + size);
   }
   return result;
 }
@@ -1107,8 +1151,7 @@ void FreeContainer(ContainerHeader* container) {
 
 void ObjectContainer::Init(const TypeInfo* typeInfo) {
   RuntimeAssert(typeInfo->instanceSize_ >= 0, "Must be an object");
-  uint32_t alloc_size =
-      sizeof(ContainerHeader) + typeInfo->instanceSize_;
+  uint32_t alloc_size = sizeof(ContainerHeader) + typeInfo->instanceSize_;
   header_ = AllocContainer(alloc_size);
   if (header_) {
     // One object in this container.
@@ -1273,6 +1316,7 @@ MemoryState* InitMemory() {
 #if USE_GC
   memoryState->toFree = konanConstructInstance<ContainerHeaderList>();
   memoryState->roots = konanConstructInstance<ContainerHeaderList>();
+  memoryState->toRelease = konanConstructInstance<ContainerHeaderList>();
   memoryState->gcInProgress = false;
   initThreshold(memoryState, kGcThreshold);
   memoryState->gcSuspendCount = 0;
@@ -1287,7 +1331,7 @@ void DeinitMemory(MemoryState* memoryState) {
   RuntimeAssert(memoryState->toFree->size() == 0, "Some memory have not been released after GC");
   konanDestructInstance(memoryState->toFree);
   konanDestructInstance(memoryState->roots);
-
+  konanDestructInstance(memoryState->toRelease);
   RuntimeAssert(memoryState->finalizerQueue == nullptr, "Finalizer queue must be empty");
   RuntimeAssert(memoryState->finalizerQueueSize == 0, "Finalizer queue must be empty");
 
@@ -1479,40 +1523,49 @@ ObjHeader** GetParamSlotIfArena(ObjHeader* param, ObjHeader** localSlot) {
   return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&chunk->arena) | ARENA_BIT);
 }
 
-ALWAYS_INLINE void updateRef(ObjHeader** location, const ObjHeader* object) {
-  RuntimeAssert(!isArenaSlot(location), "must not be a slot");
+void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
+  UPDATE_REF_EVENT(memoryState, *location, object, location, 1);
   ObjHeader* old = *location;
   if (old != object) {
     if (object != nullptr) {
-      addRef(object);
-    }
+        AddStackRef(object);
+      }
     *const_cast<const ObjHeader**>(location) = object;
-    if (reinterpret_cast<uintptr_t>(old) > 1) {
-      releaseRef(old);
+    if (old != nullptr ) {
+      ReleaseStackRef(old);
     }
   }
 }
 
-void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
-  UPDATE_REF_EVENT(memoryState, *location, object, location, 1);
-  updateRef(location, object);
-}
-
 void UpdateHeapRef(ObjHeader** location, const ObjHeader* object) {
   UPDATE_REF_EVENT(memoryState, *location, object, location, 0);
-  updateRef(location, object);
+  ObjHeader* old = *location;
+  if (old != object) {
+    if (object != nullptr) {
+      AddHeapRef(object);
+    }
+    *const_cast<const ObjHeader**>(location) = object;
+    if (reinterpret_cast<uintptr_t>(old) > 1) {
+      ReleaseHeapRef(old);
+    }
+  }
 }
 
+#if 0
 ALWAYS_INLINE inline ObjHeader** slotAddressFor(ObjHeader** returnSlot, const ObjHeader* value) {
-    if (!isArenaSlot(returnSlot)) return returnSlot;
-    // Not a subject of reference counting.
-    if (value == nullptr || !isRefCounted(value)) return nullptr;
-    return initedArena(asArenaSlot(returnSlot))->getSlot();
+  if (!isArenaSlot(returnSlot)) return returnSlot;
+  // Not a subject of reference counting.
+  if (value == nullptr || !isRefCounted(value)) return nullptr;
+  return initedArena(asArenaSlot(returnSlot))->getSlot();
 }
+#endif
 
 ALWAYS_INLINE inline void updateReturnRefAdded(ObjHeader** returnSlot, const ObjHeader* value) {
+  // TODO: this will break arenas and escape analysis, rethink.
+#if 0
   returnSlot = slotAddressFor(returnSlot, value);
   if (returnSlot == nullptr) return;
+#endif
   ObjHeader* old = *returnSlot;
   UPDATE_REF_EVENT(memoryState, old, value, returnSlot, 1);
   *const_cast<const ObjHeader**>(returnSlot) = value;
@@ -1522,8 +1575,11 @@ ALWAYS_INLINE inline void updateReturnRefAdded(ObjHeader** returnSlot, const Obj
 }
 
 void UpdateReturnRef(ObjHeader** returnSlot, const ObjHeader* value) {
+  // TODO: this will break arenas and escape analysis, rethink.
+#if 0
   returnSlot = slotAddressFor(returnSlot, value);
   if (returnSlot == nullptr) return;
+#endif
   UpdateStackRef(returnSlot, value);
 }
 
@@ -1549,9 +1605,16 @@ void UpdateHeapRefIfNull(ObjHeader** location, const ObjHeader* object) {
 
 void EnterFrame(ObjHeader** start, int parameters, int count) {
   MEMORY_LOG("EnterFrame %p .. %p\n", start, start + count + parameters)
+  FrameOverlay* frame = reinterpret_cast<FrameOverlay*>(start);
+  auto* state = memoryState;
+  frame->previous = state->currentFrame;
+  state->currentFrame = frame;
+  // TODO: maybe compress in single value somehow.
+  frame->parameters = parameters;
+  frame->count = count;
 }
 
-inline void releaseStackRefs(MemoryState* state, ObjHeader** start, int count) {
+ALWAYS_INLINE inline void releaseStackRefs(MemoryState* state, ObjHeader** start, int count) {
   MEMORY_LOG("ReleaseStackRefs %p .. %p\n", start, start + count)
   ObjHeader** current = start;
   while (count-- > 0) {
@@ -1559,8 +1622,6 @@ inline void releaseStackRefs(MemoryState* state, ObjHeader** start, int count) {
     if (object != nullptr) {
       UPDATE_REF_EVENT(memoryState, object, nullptr, current, 1);
       ReleaseStackRef(object);
-      // Just for sanity, optional.
-      *current = nullptr;
     }
     current++;
   }
@@ -1569,7 +1630,10 @@ inline void releaseStackRefs(MemoryState* state, ObjHeader** start, int count) {
 void LeaveFrame(ObjHeader** start, int parameters, int count) {
   MEMORY_LOG("LeaveFrame %p .. %p\n", start, start + count + parameters)
   auto* state = memoryState;
+  FrameOverlay* frame = reinterpret_cast<FrameOverlay*>(start);
   releaseStackRefs(state, start + parameters + kFrameOverlaySlots, count - kFrameOverlaySlots - parameters);
+  state->currentFrame = frame->previous;
+#if 0
   if (*start != nullptr) {
     auto arena = initedArena(start);
     MEMORY_LOG("LeaveFrame: free arena %p\n", arena)
@@ -1577,10 +1641,52 @@ void LeaveFrame(ObjHeader** start, int parameters, int count) {
     konanFreeMemory(arena);
     MEMORY_LOG("LeaveFrame: free arena done %p\n", arena)
   }
+#endif
 }
 
 
 #if USE_GC
+
+void incrementStack(MemoryState* state) {
+  FrameOverlay* frame = state->currentFrame;
+  while (frame != nullptr) {
+    ObjHeader** current = reinterpret_cast<ObjHeader*>(frame) + frame->parameters;
+    ObjHeader* end = current + frame->count;
+    while (current < end) {
+      ObjHeader* obj = *current++;
+      if (obj != nullptr) {
+        auto* container = obj->container();
+        if (container != nullptr && container->tag() == CONTAINER_TAG_NORMAL)
+          container->incRefCount<false>();
+      }
+    }
+    frame = frame->previous;
+  }
+}
+
+void processDecrements(MemoryState* state) {
+  for (ContainerHeader* it: *state->toRelease) {
+    DecrementRC(container);
+  }
+  state->toRelease->clear();
+}
+
+void decrementStack(MemoryState* state) {
+  FrameOverlay* frame = state->currentFrame;
+  while (frame != nullptr) {
+    ObjHeader** current = reinterpret_cast<ObjHeader*>(frame) + frame->parameters;
+    ObjHeader* end = current + frame->count;
+    while (current < end) {
+      ObjHeader* obj = *current++;
+      if (obj != nullptr) {
+        auto* container = obj->container();
+        if (container != nullptr && container->tag() == CONTAINER_TAG_NORMAL)
+          EnqueueDecrementRC</* Atomic= */ false, /* UseCycleCollector = */ true>(container);
+      }
+    }
+    frame = frame->previous;
+  }
+}
 
 void GarbageCollect() {
   MemoryState* state = memoryState;
@@ -1593,6 +1699,10 @@ void GarbageCollect() {
 #endif
 
   state->gcInProgress = true;
+
+  incrementStack(state);
+  processDecrements(state);
+  decrementStack(state);
 
   processFinalizerQueue(state);
 
