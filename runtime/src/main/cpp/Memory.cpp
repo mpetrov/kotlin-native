@@ -605,6 +605,7 @@ inline void scheduleDestroyContainer(MemoryState* state, ContainerHeader* contai
 
 template <bool Atomic>
 inline void IncrementRC(ContainerHeader* container) {
+  UPDATE_ADDREF_STAT(memoryState, container, Atomic);
   container->incRefCount<Atomic>();
 }
 
@@ -625,6 +626,13 @@ inline void EnqueueDecrementRC(ContainerHeader* container) {
 inline uint32_t freeableSize(MemoryState* state) {
   return state->toFree->size();
 }
+
+template <bool Atomic>
+inline void IncrementRC(ContainerHeader* container) {
+  container->incRefCount<Atomic>();
+  //container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
+}
+
 
 template <bool Atomic, bool UseCycleCollector>
 inline void DecrementRC(ContainerHeader* container) {
@@ -949,9 +957,10 @@ ALWAYS_INLINE inline void AddHeapRef(ContainerHeader* container) {
   }
 }
 
-ALWAYS_INLINE inline void AddHeapRef(ObjHeader* header) {
+ALWAYS_INLINE inline void AddHeapRef(const ObjHeader* header) {
   auto* container = header->container();
-  if (container != nullptr) AddHeapRef(container);
+  if (container != nullptr)
+    AddHeapRef(const_cast<ContainerHeader*>(container));
 }
 
 ALWAYS_INLINE inline void AddStackRef(ContainerHeader* container) {
@@ -967,9 +976,10 @@ ALWAYS_INLINE inline void AddStackRef(ContainerHeader* container) {
   }
 }
 
-ALWAYS_INLINE inline void AddStackRef(ObjHeader* header) {
+ALWAYS_INLINE inline void AddStackRef(const ObjHeader* header) {
   auto* container = header->container();
-  if (container != nullptr) AddStackRef(container);
+  if (container != nullptr)
+    AddStackRef(const_cast<ContainerHeader*>(container));
 }
 
 ALWAYS_INLINE inline void ReleaseHeapRef(ContainerHeader* container) {
@@ -1000,14 +1010,16 @@ ALWAYS_INLINE inline void ReleaseStackRef(ContainerHeader* container) {
   }
 }
 
-ALWAYS_INLINE inline void ReleaseHeapRef(ObjHeader* header) {
+ALWAYS_INLINE inline void ReleaseHeapRef(const ObjHeader* header) {
   auto* container = header->container();
-  if (container != nullptr) ReleaseHeapRef(container);
+  if (container != nullptr)
+    ReleaseHeapRef(const_cast<ContainerHeader*>(container));
 }
 
-ALWAYS_INLINE inline void ReleaseStackRef(ObjHeader* header) {
+ALWAYS_INLINE inline void ReleaseStackRef(const ObjHeader* header) {
   auto* container = header->container();
-  if (container != nullptr) ReleaseStackRef(container);
+  if (container != nullptr)
+    ReleaseStackRef(const_cast<ContainerHeader*>(container));
 }
 
 // We use first slot as place to store frame-local arena container.
@@ -1153,6 +1165,7 @@ void ObjectContainer::Init(const TypeInfo* typeInfo) {
   RuntimeAssert(typeInfo->instanceSize_ >= 0, "Must be an object");
   uint32_t alloc_size = sizeof(ContainerHeader) + typeInfo->instanceSize_;
   header_ = AllocContainer(alloc_size);
+  RuntimeCheck(header_ != nullptr, "Cannot alloc memory");
   if (header_) {
     // One object in this container.
     header_->setObjectCount(1);
@@ -1168,7 +1181,7 @@ void ArrayContainer::Init(const TypeInfo* typeInfo, uint32_t elements) {
   uint32_t alloc_size =
       sizeof(ContainerHeader) + arrayObjectSize(typeInfo, elements);
   header_ = AllocContainer(alloc_size);
-  RuntimeAssert(header_ != nullptr, "Cannot alloc memory");
+  RuntimeCheck(header_ != nullptr, "Cannot alloc memory");
   if (header_) {
     // One object in this container.
     header_->setObjectCount(1);
@@ -1209,7 +1222,7 @@ bool ArenaContainer::allocContainer(container_size_t minSize) {
   size = alignUp(size, kContainerAlignment);
   // TODO: keep simple cache of container chunks.
   ContainerChunk* result = konanConstructSizedInstance<ContainerChunk>(size);
-  RuntimeAssert(result != nullptr, "Cannot alloc memory");
+  RuntimeCheck(result != nullptr, "Cannot alloc memory");
   if (result == nullptr) return false;
   result->next = currentChunk_;
   result->arena = this;
@@ -1274,22 +1287,6 @@ ArrayHeader* ArenaContainer::PlaceArray(const TypeInfo* type_info, uint32_t coun
   return result;
 }
 
-inline void addRef(const ObjHeader* object) {
-  auto* container = object->container();
-  if (container != nullptr) {
-    MEMORY_LOG("AddRef on %p in %p\n", object, container)
-    addRef(container);
-  }
-}
-
-inline void releaseRef(const ObjHeader* object) {
-  auto* container = object->container();
-  if (container != nullptr) {
-    MEMORY_LOG("ReleaseRef on %p in %p\n", object, container)
-    releaseRef(container);
-  }
-}
-
 void AddRefFromAssociatedObject(const ObjHeader* object) {
   AddHeapRef(const_cast<ObjHeader*>(object));
 }
@@ -1352,6 +1349,7 @@ void DeinitMemory(MemoryState* memoryState) {
 #endif
 
   PRINT_EVENT(memoryState)
+  DEINIT_EVENT(memoryState)
   DEINIT_EVENT(memoryState)
 
   konanFreeMemory(memoryState);
@@ -1525,11 +1523,12 @@ ObjHeader** GetParamSlotIfArena(ObjHeader* param, ObjHeader** localSlot) {
 
 void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
   UPDATE_REF_EVENT(memoryState, *location, object, location, 1);
+  RuntimeAssert(object != reinterpret_cast<ObjHeader*>(1), "Must never be like that");
   ObjHeader* old = *location;
   if (old != object) {
     if (object != nullptr) {
-        AddStackRef(object);
-      }
+      AddStackRef(object);
+    }
     *const_cast<const ObjHeader**>(location) = object;
     if (old != nullptr ) {
       ReleaseStackRef(old);
@@ -1604,7 +1603,7 @@ void UpdateHeapRefIfNull(ObjHeader** location, const ObjHeader* object) {
 }
 
 void EnterFrame(ObjHeader** start, int parameters, int count) {
-  MEMORY_LOG("EnterFrame %p .. %p\n", start, start + count + parameters)
+  MEMORY_LOG("EnterFrame %p: %d parameters %d locals\n", start, parameters, count)
   FrameOverlay* frame = reinterpret_cast<FrameOverlay*>(start);
   auto* state = memoryState;
   frame->previous = state->currentFrame;
@@ -1628,10 +1627,11 @@ ALWAYS_INLINE inline void releaseStackRefs(MemoryState* state, ObjHeader** start
 }
 
 void LeaveFrame(ObjHeader** start, int parameters, int count) {
-  MEMORY_LOG("LeaveFrame %p .. %p\n", start, start + count + parameters)
+  MEMORY_LOG("LeaveFrame %p: %d parameters %d locals\n", start, parameters, count)
   auto* state = memoryState;
   FrameOverlay* frame = reinterpret_cast<FrameOverlay*>(start);
-  releaseStackRefs(state, start + parameters + kFrameOverlaySlots, count - kFrameOverlaySlots - parameters);
+  ObjHeader** slots = reinterpret_cast<ObjHeader**>(frame + 1) + parameters;
+  releaseStackRefs(state, slots, count - kFrameOverlaySlots - parameters);
   state->currentFrame = frame->previous;
 #if 0
   if (*start != nullptr) {
@@ -1650,14 +1650,39 @@ void LeaveFrame(ObjHeader** start, int parameters, int count) {
 void incrementStack(MemoryState* state) {
   FrameOverlay* frame = state->currentFrame;
   while (frame != nullptr) {
-    ObjHeader** current = reinterpret_cast<ObjHeader*>(frame) + frame->parameters;
-    ObjHeader* end = current + frame->count;
+    ObjHeader** current = reinterpret_cast<ObjHeader**>(frame + 1) + frame->parameters;
+    ObjHeader** end = current + frame->count - kFrameOverlaySlots - frame->parameters;
     while (current < end) {
       ObjHeader* obj = *current++;
       if (obj != nullptr) {
         auto* container = obj->container();
         if (container != nullptr && container->tag() == CONTAINER_TAG_NORMAL)
-          container->incRefCount<false>();
+          IncrementRC<false>(container);
+      }
+    }
+    frame = frame->previous;
+  }
+}
+
+void incrementNewlyFrozenOnStack(MemoryState* state, const ContainerHeaderSet* newlyFrozen) {
+  FrameOverlay* frame = state->currentFrame;
+  MEMORY_LOG("incrementNewlyFrozenOnStack: newly frozen size is %d\n", newlyFrozen->size())
+  while (frame != nullptr) {
+    MEMORY_LOG("current frame %p: %d parameters %d locals\n", frame, frame->parameters, frame->count)
+    ObjHeader** current = reinterpret_cast<ObjHeader**>(frame + 1) + frame->parameters;
+    ObjHeader** end = current + frame->count - kFrameOverlaySlots - frame->parameters;
+    while (current < end) {
+      ObjHeader* obj = *current;
+      MEMORY_LOG("obj at %p is %p\n", current, obj)
+      current++;
+      if (obj != nullptr) {
+        auto* container = obj->container();
+        // No need to use atomic increment yet, object is still local.
+        if (container != nullptr &&
+            container->tag() == CONTAINER_TAG_FROZEN &&
+            newlyFrozen->count(container) != 0) {
+          IncrementRC<false>(container);
+        }
       }
     }
     frame = frame->previous;
@@ -1665,17 +1690,20 @@ void incrementStack(MemoryState* state) {
 }
 
 void processDecrements(MemoryState* state) {
+  state->gcSuspendCount++;
   for (ContainerHeader* it: *state->toRelease) {
-    DecrementRC(container);
+    DecrementRC(it);
   }
   state->toRelease->clear();
+  state->gcSuspendCount--;
 }
 
 void decrementStack(MemoryState* state) {
+  state->gcSuspendCount++;
   FrameOverlay* frame = state->currentFrame;
   while (frame != nullptr) {
-    ObjHeader** current = reinterpret_cast<ObjHeader*>(frame) + frame->parameters;
-    ObjHeader* end = current + frame->count;
+    ObjHeader** current = reinterpret_cast<ObjHeader**>(frame + 1) + frame->parameters;
+    ObjHeader** end = current + frame->count - kFrameOverlaySlots - frame->parameters;
     while (current < end) {
       ObjHeader* obj = *current++;
       if (obj != nullptr) {
@@ -1686,6 +1714,7 @@ void decrementStack(MemoryState* state) {
     }
     frame = frame->previous;
   }
+  state->gcSuspendCount--;
 }
 
 void GarbageCollect() {
@@ -1950,7 +1979,7 @@ void traverseStronglyConnectedComponent(ContainerHeader* start,
   }
 }
 
-void freezeAcyclic(ContainerHeader* rootContainer) {
+void freezeAcyclic(ContainerHeader* rootContainer, ContainerHeaderSet* newlyFrozen) {
   KStdDeque<ContainerHeader*> queue;
   queue.push_back(rootContainer);
   while (!queue.empty()) {
@@ -1961,6 +1990,8 @@ void freezeAcyclic(ContainerHeader* rootContainer) {
     current->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
     // Note, that once object is frozen, it could be concurrently accessed, so
     // color and similar attributes shall not be used.
+    if (current->tag() == CONTAINER_TAG_NORMAL)
+      newlyFrozen->insert(current);
     current->freeze();
     traverseContainerReferredObjects(current, [current, &queue](ObjHeader* obj) {
         ContainerHeader* objContainer = obj->container();
@@ -1972,7 +2003,9 @@ void freezeAcyclic(ContainerHeader* rootContainer) {
   }
 }
 
-void freezeCyclic(ContainerHeader* rootContainer, const KStdVector<ContainerHeader*>& order) {
+void freezeCyclic(ContainerHeader* rootContainer,
+                  const KStdVector<ContainerHeader*>& order,
+                  ContainerHeaderSet* newlyFrozen) {
   KStdUnorderedMap<ContainerHeader*, KStdVector<ContainerHeader*>> reversedEdges;
   KStdDeque<ContainerHeader*> queue;
   queue.push_back(rootContainer);
@@ -2025,6 +2058,8 @@ void freezeCyclic(ContainerHeader* rootContainer, const KStdVector<ContainerHead
     for (auto* container : component) {
       container->resetBuffered();
       container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
+      if (container->tag() == CONTAINER_TAG_NORMAL)
+        newlyFrozen->insert(container);
       // Note, that once object is frozen, it could be concurrently accessed, so
       // color and similar attributes shall not be used.
       container->freeze();
@@ -2078,11 +2113,12 @@ void FreezeSubgraph(ObjHeader* root) {
   if (firstBlocker != nullptr) {
     ThrowFreezingException(root, firstBlocker);
   }
+  ContainerHeaderSet newlyFrozen;
   // Now unmark all marked objects, and freeze them, if no cycles detected.
   if (hasCycles) {
-    freezeCyclic(rootContainer, order);
+    freezeCyclic(rootContainer, order, &newlyFrozen);
   } else {
-    freezeAcyclic(rootContainer );
+    freezeAcyclic(rootContainer, &newlyFrozen);
   }
 
 #if USE_GC
@@ -2094,6 +2130,8 @@ void FreezeSubgraph(ObjHeader* root) {
       if (!isMarkedAsRemoved(container) && container->frozen())
         container = markAsRemoved(container);
   }
+  // Actualize reference counters of newly frozen objects.
+  incrementNewlyFrozenOnStack(memoryState, &newlyFrozen);
 #endif
 }
 
