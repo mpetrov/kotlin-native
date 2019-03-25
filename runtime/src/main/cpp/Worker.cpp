@@ -66,11 +66,9 @@ KNativePtr transfer(KRef object, KInt mode) {
     case CHECKED:
     case UNCHECKED:
       if (!ClearSubgraphReferences(object, mode == CHECKED)) {
-        // Release reference to the object, as it is not being managed by ObjHolder.
-        ZeroHeapRef(&object);
         ThrowWorkerInvalidState();
       }
-      return object;
+      return CreateStablePointer(object);
   }
   return nullptr;
 }
@@ -373,7 +371,10 @@ void* workerRoutine(void* argument) {
   g_currentWorkerId = worker->id();
   Kotlin_initRuntimeIfNeeded();
 
+  ObjHolder argumentHolder;
+  ObjHolder resultHolder;
   while (true) {
+    konan::consolePrintf("1\n");
     Job job = worker->getJob();
     if (job.function == nullptr) {
        // Termination request, notify the future.
@@ -381,27 +382,34 @@ void* workerRoutine(void* argument) {
       theState()->removeWorkerUnlocked(worker->id());
       break;
     }
-    ObjHolder argumentHolder;
+
+    konan::consolePrintf("2\n");
     KRef argument = AdoptStablePointer(job.argument, argumentHolder.slot());
-    // Note that this is a bit hacky, as we must not auto-release resultRef,
-    // so we don't use ObjHolder.
-    // It is so, as ownership is transferred.
-    KRef resultRef = nullptr;
+    konan::consolePrintf("3\n");
     KNativePtr result = nullptr;
     bool ok = true;
     try {
-        job.function(argument, &resultRef);
+        job.function(argument, resultHolder.slot());
+        konan::consolePrintf("4\n");
         argumentHolder.clear();
+        konan::consolePrintf("5\n");
         // Transfer the result.
-        result = transfer(resultRef, job.transferMode);
+        result = transfer(resultHolder.obj(), job.transferMode);
     } catch (ObjHolder& e) {
         ok = false;
         if (worker->errorReporting())
             ReportUnhandledException(e.obj());
     }
+    konan::consolePrintf("6\n");
     // Notify the future.
     job.future->storeResultUnlocked(result, ok);
+    konan::consolePrintf("7\n");
+
+    resultHolder.clear();
+    konan::consolePrintf("8\n");
+
   }
+  konan::consolePrintf("9\n");
 
   Kotlin_deinitRuntimeIfNeeded();
 
@@ -424,11 +432,9 @@ KInt currentWorker() {
 
 KInt schedule(KInt id, KInt transferMode, KRef producer, KNativePtr jobFunction) {
   Job job;
-  // Note that this is a bit hacky, as we must not auto-release jobArgumentRef,
-  // so we don't use ObjHolder.
-  KRef jobArgumentRef = nullptr;
-  WorkerLaunchpad(producer, &jobArgumentRef);
-  KNativePtr jobArgument = transfer(jobArgumentRef, transferMode);
+  ObjHolder holder;
+  WorkerLaunchpad(producer, holder.slot());
+  KNativePtr jobArgument = transfer(holder.obj(), transferMode);
   Future* future = theState()->addJobToWorkerUnlocked(id, jobFunction, jobArgument, false, transferMode);
   if (future == nullptr) ThrowWorkerInvalidState();
   return future->id();
@@ -462,8 +468,9 @@ OBJ_GETTER(attachObjectGraphInternal, KNativePtr stable) {
 }
 
 KNativePtr detachObjectGraphInternal(KInt transferMode, KRef producer) {
-   KRef ref = nullptr;
-   WorkerLaunchpad(producer, &ref);
+   ObjHolder result;
+   WorkerLaunchpad(producer, result.slot());
+   KRef ref = result.obj();
    if (ref != nullptr) {
      return transfer(ref, transferMode);
    } else

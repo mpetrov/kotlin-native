@@ -35,7 +35,7 @@
 // http://researcher.watson.ibm.com/researcher/files/us-bacon/Bacon03Pure.pdf.
 #define USE_GC 1
 // Define to 1 to print all memory operations.
-#define TRACE_MEMORY 0
+#define TRACE_MEMORY 1
 // Collect memory manager events statistics.
 #define COLLECT_STATISTIC 0
 // Auto-adjust GC thresholds.
@@ -68,6 +68,8 @@ constexpr size_t kGcThreshold = 4 * 1024;
 constexpr double kGcToComputeRatioThreshold = 0.5;
 // Never exceed this value when increasing GC threshold.
 constexpr size_t kMaxErgonomicThreshold = 1024 * 1024;
+// Threshold of release candidate set.
+constexpr size_t kMaxReleaseSetSize = 32 * 1024;
 #endif  // GC_ERGONOMICS
 
 typedef KStdDeque<ContainerHeader*> ContainerHeaderDeque;
@@ -152,7 +154,6 @@ public:
 
   void incReleaseRef(const ContainerHeader* header, bool atomic, bool cyclic, int stack) {
    if (atomic) {
-      RuntimeAssert(!cyclic, "Atomic updates cannot be cyclic yet");
       atomicReleaseRefs++;
     } else {
       if (cyclic) releaseCyclicRefs++; else releaseRefs++;
@@ -567,6 +568,16 @@ inline ContainerHeader* clearRemoved(ContainerHeader* container) {
     reinterpret_cast<uintptr_t>(container) & ~static_cast<uintptr_t>(1));
 }
 
+inline bool isHeapReturnSlot(ObjHeader** slot) {
+  return (reinterpret_cast<uintptr_t>(slot) & 1) != 0;
+}
+
+inline ObjHeader** makeHeapReturnSlot(ObjHeader** slot) {
+  return reinterpret_cast<ObjHeader**>(
+             reinterpret_cast<uintptr_t>(slot) & ~static_cast<uintptr_t>(1));
+}
+
+
 inline void processFinalizerQueue(MemoryState* state) {
   // TODO: reuse elements of finalizer queue for new allocations.
   while (state->finalizerQueue != nullptr) {
@@ -689,7 +700,7 @@ template <bool Atomic, bool UseCycleCollector>
 inline void EnqueueDecrementRC(ContainerHeader* container) {
   auto state = memoryState;
   state->toRelease->push_back(container);
-  if (state->toRelease->size() > 16384 && state->gcSuspendCount == 0) {
+  if (state->toRelease->size() > kMaxReleaseSetSize - 16 && state->gcSuspendCount == 0) {
     GarbageCollect();
   }
 }
@@ -1314,6 +1325,7 @@ MemoryState* InitMemory() {
   memoryState->toFree = konanConstructInstance<ContainerHeaderList>();
   memoryState->roots = konanConstructInstance<ContainerHeaderList>();
   memoryState->toRelease = konanConstructInstance<ContainerHeaderList>();
+  memoryState->toRelease->reserve(kMaxReleaseSetSize);
   memoryState->gcInProgress = false;
   initThreshold(memoryState, kGcThreshold);
   memoryState->gcSuspendCount = 0;
@@ -1565,6 +1577,7 @@ ALWAYS_INLINE inline void updateReturnRefAdded(ObjHeader** returnSlot, const Obj
   returnSlot = slotAddressFor(returnSlot, value);
   if (returnSlot == nullptr) return;
 #endif
+  RuntimeAssert(!isHeapReturnSlot(returnSlot), "must always be stack");
   ObjHeader* old = *returnSlot;
   UPDATE_REF_EVENT(memoryState, old, value, returnSlot, 1);
   *const_cast<const ObjHeader**>(returnSlot) = value;
@@ -1579,7 +1592,10 @@ void UpdateReturnRef(ObjHeader** returnSlot, const ObjHeader* value) {
   returnSlot = slotAddressFor(returnSlot, value);
   if (returnSlot == nullptr) return;
 #endif
-  UpdateStackRef(returnSlot, value);
+  if (isHeapReturnSlot(returnSlot))
+    UpdateHeapRef(makeHeapReturnSlot(returnSlot), value);
+  else
+    UpdateStackRef(returnSlot, value);
 }
 
 void UpdateHeapRefIfNull(ObjHeader** location, const ObjHeader* object) {
@@ -1614,6 +1630,7 @@ void EnterFrame(ObjHeader** start, int parameters, int count) {
 }
 
 ALWAYS_INLINE inline void releaseStackRefs(MemoryState* state, ObjHeader** start, int count) {
+  if (count == 0) return;
   MEMORY_LOG("ReleaseStackRefs %p .. %p\n", start, start + count)
   ObjHeader** current = start;
   while (count-- > 0) {
@@ -1673,7 +1690,6 @@ void incrementNewlyFrozenOnStack(MemoryState* state, const ContainerHeaderSet* n
     ObjHeader** end = current + frame->count - kFrameOverlaySlots - frame->parameters;
     while (current < end) {
       ObjHeader* obj = *current;
-      MEMORY_LOG("obj at %p is %p\n", current, obj)
       current++;
       if (obj != nullptr) {
         auto* container = obj->container();
@@ -1824,6 +1840,7 @@ KInt Kotlin_native_internal_GC_getThreshold(KRef) {
 
 KNativePtr CreateStablePointer(KRef any) {
   if (any == nullptr) return nullptr;
+  MEMORY_LOG("CreateStablePointer for %p rc=%d\n", any, any->container() ? any->container()->refCount() : 0)
   AddHeapRef(any);
   return reinterpret_cast<KNativePtr>(any);
 }
@@ -1842,8 +1859,7 @@ OBJ_GETTER(DerefStablePointer, KNativePtr pointer) {
 OBJ_GETTER(AdoptStablePointer, KNativePtr pointer) {
   synchronize();
   KRef ref = reinterpret_cast<KRef>(pointer);
-  // TODO: as it is called from C runtime,
-  ZeroHeapRef(OBJ_RESULT);
+  UpdateReturnRef(OBJ_RESULT, nullptr);
   // Somewhat hacky.
   *OBJ_RESULT = ref;
   return ref;
@@ -1857,7 +1873,8 @@ bool hasExternalRefs(ContainerHeader* start, ContainerHeaderSet* visited) {
     auto* container = toVisit.front();
     toVisit.pop_front();
     visited->insert(container);
-    if (container->refCount() != 0) return true;
+    MEMORY_LOG("container %p with rc %d blocks transfer\n", container, container->refCount())
+    if (container->refCount() > 0) return true;
     traverseContainerReferredObjects(container, [&toVisit, visited](ObjHeader* ref) {
         auto* child = ref->container();
         if (!Shareable(child) && (visited->count(child) == 0)) {
@@ -1877,15 +1894,15 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
 
     if (container == nullptr || container->frozen())
       // We assume, that frozen objects can be safely passed and are already removed
-      // GC candidate list.
+      // from the GC candidate list.
       return true;
 
     ContainerHeaderSet visited;
     if (!checked) {
       hasExternalRefs(container, &visited);
     } else {
+      container->decRefCount<false>();
       if (!Shareable(container)) {
-        container->decRefCount<false>();
         MarkGray<false>(container);
         auto bad = hasExternalRefs(container, &visited);
         ScanBlack<false>(container);

@@ -575,7 +575,9 @@ class ObjHolder {
 
    ObjHeader* obj() { return obj_; }
    const ObjHeader* obj() const { return obj_; }
-   ObjHeader** slot() { return &obj_; }
+   ObjHeader** slot() {
+     return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&obj_) | 1);
+   }
    void clear() { ::ZeroHeapRef(&obj_); }
 
   private:
