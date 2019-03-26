@@ -35,7 +35,7 @@
 // http://researcher.watson.ibm.com/researcher/files/us-bacon/Bacon03Pure.pdf.
 #define USE_GC 1
 // Define to 1 to print all memory operations.
-#define TRACE_MEMORY 1
+#define TRACE_MEMORY 0
 // Collect memory manager events statistics.
 #define COLLECT_STATISTIC 0
 // Auto-adjust GC thresholds.
@@ -1874,6 +1874,7 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
       return true;
 
     // Now compute how much time we shall decrement RC for reachability analysis.
+    // Initial 1 is for holder holding the object.
     int rcDecrement = 1;
     for (auto it = state->toRelease->begin(); it != state->toRelease->end(); ++it) {
       auto released = *it;
@@ -1895,12 +1896,11 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
         auto bad = hasExternalRefs(container, &visited);
         ScanBlack<false>(container);
         if (bad) {
-           for (int i = 0; i < rcDecrement; i++)
-              container->incRefCount<false>();
+           // Restore original RC if check failed.
+           for (int i = 0; i < rcDecrement; i++) container->incRefCount<false>();
            return false;
-        } else {
-          container->incRefCount<false>();
         }
+        container->incRefCount<false>();
       }
     }
 
