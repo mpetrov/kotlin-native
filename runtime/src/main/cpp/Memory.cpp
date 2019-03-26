@@ -35,7 +35,7 @@
 // http://researcher.watson.ibm.com/researcher/files/us-bacon/Bacon03Pure.pdf.
 #define USE_GC 1
 // Define to 1 to print all memory operations.
-#define TRACE_MEMORY 0
+#define TRACE_MEMORY 1
 // Collect memory manager events statistics.
 #define COLLECT_STATISTIC 0
 // Auto-adjust GC thresholds.
@@ -631,9 +631,8 @@ inline uint32_t freeableSize(MemoryState* state) {
 template <bool Atomic>
 inline void IncrementRC(ContainerHeader* container) {
   container->incRefCount<Atomic>();
-  //container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
+  container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
 }
-
 
 template <bool Atomic, bool UseCycleCollector>
 inline void DecrementRC(ContainerHeader* container) {
@@ -1321,7 +1320,9 @@ MemoryState* InitMemory() {
 
 void DeinitMemory(MemoryState* memoryState) {
 #if USE_GC
-  GarbageCollect();
+  do {
+    GarbageCollect();
+  } while (memoryState->toRelease->size() > 0);
   RuntimeAssert(memoryState->toFree->size() == 0, "Some memory have not been released after GC");
   RuntimeAssert(memoryState->toRelease->size() == 0, "Some memory have not been released after GC");
   konanDestructInstance(memoryState->toFree);
@@ -1368,8 +1369,11 @@ OBJ_GETTER(AllocInstance, const TypeInfo* type_info) {
   RuntimeAssert(type_info->instanceSize_ >= 0, "must be an object");
   auto container = ObjectContainer(type_info);
   ContainerHeader* header = container.header();
-  if (header->tag() == CONTAINER_TAG_NORMAL)
+  // We cannot collect until reference will be stored into the stack slot.
+  if (header->tag() == CONTAINER_TAG_NORMAL && !isHeapReturnSlot(OBJ_RESULT)) {
+    IncrementRC<false>(header);
     EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ false>(header);
+  }
   RETURN_OBJ(container.GetPlace());
 }
 
@@ -1378,15 +1382,18 @@ OBJ_GETTER(AllocArrayInstance, const TypeInfo* type_info, int32_t elements) {
   if (elements < 0) ThrowIllegalArgumentException();
   auto container = ArrayContainer(type_info, elements);
   ContainerHeader* header = container.header();
-  if (header->tag() == CONTAINER_TAG_NORMAL)
+  // We cannot collect until reference will be stored into the stack slot.
+  if (header->tag() == CONTAINER_TAG_NORMAL && !isHeapReturnSlot(OBJ_RESULT)) {
+    IncrementRC<false>(header);
     EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ false>(header);
+  }
   RETURN_OBJ(container.GetPlace()->obj());
 }
 
 OBJ_GETTER(InitInstance,
     ObjHeader** location, const TypeInfo* type_info, void (*ctor)(ObjHeader*)) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
   ObjHeader* value = *location;
-
   if (value != nullptr) {
     // OK'ish, inited by someone else.
     RETURN_OBJ(value);
@@ -1410,6 +1417,8 @@ OBJ_GETTER(InitInstance,
 
 OBJ_GETTER(InitSharedInstance,
     ObjHeader** location, ObjHeader** localLocation, const TypeInfo* type_info, void (*ctor)(ObjHeader*)) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
+  RuntimeAssert(!isHeapReturnSlot(localLocation), "Slot bit disalowed here");
 #if KONAN_NO_THREADS
   ObjHeader* value = *location;
   if (value != nullptr) {
@@ -1473,6 +1482,7 @@ OBJ_GETTER(InitSharedInstance,
 }
 
 void SetHeapRef(ObjHeader** location, const ObjHeader* object) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
   MEMORY_LOG("SetHeapRef *%p: %p\n", location, object)
   UPDATE_REF_EVENT(memoryState, nullptr, object, location, 0);
   *const_cast<const ObjHeader**>(location) = object;
@@ -1481,6 +1491,7 @@ void SetHeapRef(ObjHeader** location, const ObjHeader* object) {
 }
 
 void ZeroHeapRef(ObjHeader** location) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
   MEMORY_LOG("ZeroHeapRef %p\n", location)
   auto* value = *location;
   if (value != nullptr) {
@@ -1491,6 +1502,7 @@ void ZeroHeapRef(ObjHeader** location) {
 }
 
 void ZeroStackRef(ObjHeader** location) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
   MEMORY_LOG("ZeroStackRef %p\n", location)
   auto* value = *location;
   if (value != nullptr) {
@@ -1500,22 +1512,10 @@ void ZeroStackRef(ObjHeader** location) {
   }
 }
 
-ObjHeader** GetReturnSlotIfArena(ObjHeader** returnSlot, ObjHeader** localSlot) {
-  return localSlot;
-}
-
-ObjHeader** GetParamSlotIfArena(ObjHeader* param, ObjHeader** localSlot) {
-  if (param == nullptr) return localSlot;
-  auto container = param->container();
-  if (container == nullptr || (container->refCount_ & CONTAINER_TAG_MASK) != CONTAINER_TAG_STACK)
-    return localSlot;
-  RuntimeCheck(false, "Unsupported mode");
-  return nullptr;
-}
-
 void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
-  UPDATE_REF_EVENT(memoryState, *location, object, location, 1);
-  RuntimeAssert(object != reinterpret_cast<ObjHeader*>(1), "Must never be like that");
+  UPDATE_REF_EVENT(memoryState, *location, object, location, 1)
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
+  RuntimeAssert(object != reinterpret_cast<ObjHeader*>(1), "Markers disallowed here");
   ObjHeader* old = *location;
   if (old != object) {
     if (object != nullptr) {
@@ -1529,6 +1529,7 @@ void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
 }
 
 void UpdateHeapRef(ObjHeader** location, const ObjHeader* object) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit must be cleared here")
   UPDATE_REF_EVENT(memoryState, *location, object, location, 0);
   ObjHeader* old = *location;
   if (old != object) {
@@ -1540,6 +1541,16 @@ void UpdateHeapRef(ObjHeader** location, const ObjHeader* object) {
       ReleaseHeapRef(old);
     }
   }
+}
+
+ObjHeader** GetReturnSlotIfArena(ObjHeader** returnSlot, ObjHeader** localSlot) {
+  RuntimeCheck(false, "No longer supported");
+  return nullptr;
+}
+
+ObjHeader** GetParamSlotIfArena(ObjHeader** returnSlot, ObjHeader** localSlot) {
+  RuntimeCheck(false, "No longer supported");
+  return nullptr;
 }
 
 ALWAYS_INLINE inline void updateReturnRefAdded(ObjHeader** returnSlot, const ObjHeader* value) {
@@ -1564,6 +1575,7 @@ void UpdateReturnRef(ObjHeader** returnSlot, const ObjHeader* value) {
 }
 
 void UpdateHeapRefIfNull(ObjHeader** location, const ObjHeader* object) {
+  RuntimeAssert(!isHeapReturnSlot(location), "Slot bit disalowed here");
   if (object != nullptr) {
 #if KONAN_NO_THREADS
     ObjHeader* old = *location;
@@ -1673,7 +1685,7 @@ void processDecrements(MemoryState* state) {
   }
   int newElements = toRelease->size() - toReleaseCount;
   if (newElements > 0)
-    std::copy_backward(toRelease->begin() + toReleaseCount, toRelease->end(), toRelease->begin() + newElements);
+    std::copy(toRelease->begin() + toReleaseCount, toRelease->end(), toRelease->begin());
   toRelease->resize(newElements);
   state->gcSuspendCount--;
 }
@@ -1861,20 +1873,39 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
       // from the GC candidate list.
       return true;
 
+    // Now compute how much time we shall decrement RC for reachability analysis.
+    int rcDecrement = 1;
+    for (auto it = state->toRelease->begin(); it != state->toRelease->end(); ++it) {
+      auto released = *it;
+      // Actually first check is excessive, just for clarity of intentions.
+      if (!isMarkedAsRemoved(released) && container == released) {
+        *it = markAsRemoved(*it);
+        rcDecrement++;
+      }
+    }
+
     ContainerHeaderSet visited;
     if (!checked) {
       hasExternalRefs(container, &visited);
     } else {
-      container->decRefCount<false>();
       if (!Shareable(container)) {
+        for (int i = 0; i < rcDecrement; i++)
+          container->decRefCount<false>();
         MarkGray<false>(container);
         auto bad = hasExternalRefs(container, &visited);
         ScanBlack<false>(container);
-        container->incRefCount<false>();
-        if (bad) return false;
+        if (bad) {
+           for (int i = 0; i < rcDecrement; i++)
+              container->incRefCount<false>();
+           return false;
+        } else {
+          container->incRefCount<false>();
+        }
       }
     }
 
+    // Remove all no longer owned containers from GC structures.
+    state->gcSuspendCount++;
     // TODO: not very efficient traversal.
     for (auto it = state->toFree->begin(); it != state->toFree->end(); ++it) {
       auto container = *it;
@@ -1886,10 +1917,12 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
     }
     for (auto it = state->toRelease->begin(); it != state->toRelease->end(); ++it) {
       auto container = *it;
-      if (visited.count(container) != 0) {
+      if (!isMarkedAsRemoved(container) && visited.count(container) != 0) {
+        DecrementRC(container);
         *it = markAsRemoved(container);
       }
     }
+    state->gcSuspendCount--;
   }
 #endif  // USE_GC
   return true;
