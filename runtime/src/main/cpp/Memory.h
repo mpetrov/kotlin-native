@@ -438,9 +438,8 @@ class ArenaContainer {
 extern "C" {
 #endif
 
-// Bit or'ed to slot pointer, marking the fact that allocation shall happen
-// in arena pointed by the slot.
-#define ARENA_BIT 1
+// Bit or'ed to slot pointer, marking the fact that returned value is stored on the heap.
+#define HEAP_RETURN_BIT 1
 #define OBJ_RESULT __result__
 #define OBJ_GETTER0(name) ObjHeader* name(ObjHeader** OBJ_RESULT)
 #define OBJ_GETTER(name, ...) ObjHeader* name(__VA_ARGS__, ObjHeader** OBJ_RESULT)
@@ -576,7 +575,7 @@ class ObjHolder {
    ObjHeader* obj() { return obj_; }
    const ObjHeader* obj() const { return obj_; }
    ObjHeader** slot() {
-     return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&obj_) | 1);
+     return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&obj_) | HEAP_RETURN_BIT);
    }
    void clear() { ::ZeroHeapRef(&obj_); }
 

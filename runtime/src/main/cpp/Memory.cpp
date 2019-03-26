@@ -35,7 +35,7 @@
 // http://researcher.watson.ibm.com/researcher/files/us-bacon/Bacon03Pure.pdf.
 #define USE_GC 1
 // Define to 1 to print all memory operations.
-#define TRACE_MEMORY 1
+#define TRACE_MEMORY 0
 // Collect memory manager events statistics.
 #define COLLECT_STATISTIC 0
 // Auto-adjust GC thresholds.
@@ -444,15 +444,6 @@ inline container_size_t objectSize(const ObjHeader* obj) {
   return alignUp(size, kObjectAlignment);
 }
 
-inline bool isArenaSlot(ObjHeader** slot) {
-  return (reinterpret_cast<uintptr_t>(slot) & ARENA_BIT) != 0;
-}
-
-inline ObjHeader** asArenaSlot(ObjHeader** slot) {
-  return reinterpret_cast<ObjHeader**>(
-      reinterpret_cast<uintptr_t>(slot) & ~ARENA_BIT);
-}
-
 inline FrameOverlay* asFrameOverlay(ObjHeader** slot) {
   return reinterpret_cast<FrameOverlay*>(slot);
 }
@@ -569,12 +560,12 @@ inline ContainerHeader* clearRemoved(ContainerHeader* container) {
 }
 
 inline bool isHeapReturnSlot(ObjHeader** slot) {
-  return (reinterpret_cast<uintptr_t>(slot) & 1) != 0;
+  return (reinterpret_cast<uintptr_t>(slot) & HEAP_RETURN_BIT) != 0;
 }
 
-inline ObjHeader** makeHeapReturnSlot(ObjHeader** slot) {
+inline ObjHeader** makeReturnSlot(ObjHeader** slot) {
   return reinterpret_cast<ObjHeader**>(
-             reinterpret_cast<uintptr_t>(slot) & ~static_cast<uintptr_t>(1));
+             reinterpret_cast<uintptr_t>(slot) & ~static_cast<uintptr_t>(HEAP_RETURN_BIT));
 }
 
 
@@ -1338,6 +1329,7 @@ void DeinitMemory(MemoryState* memoryState) {
 #if USE_GC
   GarbageCollect();
   RuntimeAssert(memoryState->toFree->size() == 0, "Some memory have not been released after GC");
+  RuntimeAssert(memoryState->toRelease->size() == 0, "Some memory have not been released after GC");
   konanDestructInstance(memoryState->toFree);
   konanDestructInstance(memoryState->roots);
   konanDestructInstance(memoryState->toRelease);
@@ -1381,24 +1373,12 @@ void ResumeMemory(MemoryState* state) {
 
 OBJ_GETTER(AllocInstance, const TypeInfo* type_info) {
   RuntimeAssert(type_info->instanceSize_ >= 0, "must be an object");
-  if (isArenaSlot(OBJ_RESULT)) {
-    auto arena = initedArena(asArenaSlot(OBJ_RESULT));
-    auto result = arena->PlaceObject(type_info);
-    MEMORY_LOG("instance %p in arena: %p\n", result, arena)
-    return result;
-  }
   RETURN_OBJ(ObjectContainer(type_info).GetPlace());
 }
 
 OBJ_GETTER(AllocArrayInstance, const TypeInfo* type_info, int32_t elements) {
   RuntimeAssert(type_info->instanceSize_ < 0, "must be an array");
   if (elements < 0) ThrowIllegalArgumentException();
-  if (isArenaSlot(OBJ_RESULT)) {
-    auto arena = initedArena(asArenaSlot(OBJ_RESULT));
-    auto result = arena->PlaceArray(type_info, elements)->obj();
-    MEMORY_LOG("array[%d] %p in arena: %p\n", elements, result, arena)
-    return result;
-  }
   RETURN_OBJ(ArrayContainer(type_info, elements).GetPlace()->obj());
 }
 
@@ -1421,7 +1401,7 @@ OBJ_GETTER(InitInstance,
     ctor(object);
     return object;
   } catch (...) {
-    ZeroStackRef(OBJ_RESULT);
+    UpdateReturnRef(OBJ_RESULT, nullptr);
     ZeroHeapRef(location);
     throw;
   }
@@ -1448,7 +1428,7 @@ OBJ_GETTER(InitSharedInstance,
     FreezeSubgraph(object);
     return object;
   } catch (...) {
-    ZeroStackRef(OBJ_RESULT);
+    UpdateReturnRef(OBJ_RESULT, nullptr);
     ZeroHeapRef(location);
     throw;
   }
@@ -1482,7 +1462,7 @@ OBJ_GETTER(InitSharedInstance,
     synchronize();
     return object;
   } catch (...) {
-    ZeroStackRef(OBJ_RESULT);
+    UpdateReturnRef(OBJ_RESULT, nullptr);
     ZeroHeapRef(location);
     ZeroHeapRef(localLocation);
     synchronize();
@@ -1521,7 +1501,7 @@ void ZeroStackRef(ObjHeader** location) {
 }
 
 ObjHeader** GetReturnSlotIfArena(ObjHeader** returnSlot, ObjHeader** localSlot) {
-  return isArenaSlot(returnSlot) ? returnSlot : localSlot;
+  return localSlot;
 }
 
 ObjHeader** GetParamSlotIfArena(ObjHeader* param, ObjHeader** localSlot) {
@@ -1529,8 +1509,8 @@ ObjHeader** GetParamSlotIfArena(ObjHeader* param, ObjHeader** localSlot) {
   auto container = param->container();
   if (container == nullptr || (container->refCount_ & CONTAINER_TAG_MASK) != CONTAINER_TAG_STACK)
     return localSlot;
-  auto chunk = reinterpret_cast<ContainerChunk*>(container) - 1;
-  return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&chunk->arena) | ARENA_BIT);
+  RuntimeCheck(false, "Unsupported mode");
+  return nullptr;
 }
 
 void UpdateStackRef(ObjHeader** location, const ObjHeader* object) {
@@ -1562,38 +1542,23 @@ void UpdateHeapRef(ObjHeader** location, const ObjHeader* object) {
   }
 }
 
-#if 0
-ALWAYS_INLINE inline ObjHeader** slotAddressFor(ObjHeader** returnSlot, const ObjHeader* value) {
-  if (!isArenaSlot(returnSlot)) return returnSlot;
-  // Not a subject of reference counting.
-  if (value == nullptr || !isRefCounted(value)) return nullptr;
-  return initedArena(asArenaSlot(returnSlot))->getSlot();
-}
-#endif
-
 ALWAYS_INLINE inline void updateReturnRefAdded(ObjHeader** returnSlot, const ObjHeader* value) {
-  // TODO: this will break arenas and escape analysis, rethink.
-#if 0
-  returnSlot = slotAddressFor(returnSlot, value);
-  if (returnSlot == nullptr) return;
-#endif
-  RuntimeAssert(!isHeapReturnSlot(returnSlot), "must always be stack");
+  bool isHeap = isHeapReturnSlot(returnSlot);
+  returnSlot = makeReturnSlot(returnSlot);
   ObjHeader* old = *returnSlot;
-  UPDATE_REF_EVENT(memoryState, old, value, returnSlot, 1);
+  UPDATE_REF_EVENT(memoryState, old, value, returnSlot, isHeap ? 0 : 1)
   *const_cast<const ObjHeader**>(returnSlot) = value;
   if (old != nullptr) {
-    ReleaseStackRef(old);
+    if (isHeap)
+      ReleaseHeapRef(old);
+    else
+      ReleaseStackRef(old);
   }
 }
 
 void UpdateReturnRef(ObjHeader** returnSlot, const ObjHeader* value) {
-  // TODO: this will break arenas and escape analysis, rethink.
-#if 0
-  returnSlot = slotAddressFor(returnSlot, value);
-  if (returnSlot == nullptr) return;
-#endif
   if (isHeapReturnSlot(returnSlot))
-    UpdateHeapRef(makeHeapReturnSlot(returnSlot), value);
+    UpdateHeapRef(makeReturnSlot(returnSlot), value);
   else
     UpdateStackRef(returnSlot, value);
 }
@@ -1708,6 +1673,8 @@ void incrementNewlyFrozenOnStack(MemoryState* state, const ContainerHeaderSet* n
 void processDecrements(MemoryState* state) {
   state->gcSuspendCount++;
   for (ContainerHeader* it: *state->toRelease) {
+    if (isMarkedAsRemoved(it))
+        continue;
     DecrementRC(it);
   }
   state->toRelease->clear();
@@ -1861,7 +1828,7 @@ OBJ_GETTER(AdoptStablePointer, KNativePtr pointer) {
   KRef ref = reinterpret_cast<KRef>(pointer);
   UpdateReturnRef(OBJ_RESULT, nullptr);
   // Somewhat hacky.
-  *OBJ_RESULT = ref;
+  *makeReturnSlot(OBJ_RESULT) = ref;
   return ref;
 }
 
@@ -1917,6 +1884,12 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
       if (visited.count(container) != 0) {
         container->resetBuffered();
         container->setColorAssertIfGreen(CONTAINER_TAG_GC_BLACK);
+        *it = markAsRemoved(container);
+      }
+    }
+    for (auto it = state->toRelease->begin(); it != state->toRelease->end(); ++it) {
+      auto container = *it;
+      if (visited.count(container) != 0) {
         *it = markAsRemoved(container);
       }
     }

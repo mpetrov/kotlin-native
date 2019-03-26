@@ -374,7 +374,6 @@ void* workerRoutine(void* argument) {
   ObjHolder argumentHolder;
   ObjHolder resultHolder;
   while (true) {
-    konan::consolePrintf("1\n");
     Job job = worker->getJob();
     if (job.function == nullptr) {
        // Termination request, notify the future.
@@ -383,16 +382,12 @@ void* workerRoutine(void* argument) {
       break;
     }
 
-    konan::consolePrintf("2\n");
     KRef argument = AdoptStablePointer(job.argument, argumentHolder.slot());
-    konan::consolePrintf("3\n");
     KNativePtr result = nullptr;
     bool ok = true;
     try {
         job.function(argument, resultHolder.slot());
-        konan::consolePrintf("4\n");
         argumentHolder.clear();
-        konan::consolePrintf("5\n");
         // Transfer the result.
         result = transfer(resultHolder.obj(), job.transferMode);
     } catch (ObjHolder& e) {
@@ -400,16 +395,10 @@ void* workerRoutine(void* argument) {
         if (worker->errorReporting())
             ReportUnhandledException(e.obj());
     }
-    konan::consolePrintf("6\n");
     // Notify the future.
     job.future->storeResultUnlocked(result, ok);
-    konan::consolePrintf("7\n");
-
     resultHolder.clear();
-    konan::consolePrintf("8\n");
-
   }
-  konan::consolePrintf("9\n");
 
   Kotlin_deinitRuntimeIfNeeded();
 
