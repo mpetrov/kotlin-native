@@ -371,33 +371,35 @@ void* workerRoutine(void* argument) {
   g_currentWorkerId = worker->id();
   Kotlin_initRuntimeIfNeeded();
 
-  ObjHolder argumentHolder;
-  ObjHolder resultHolder;
-  while (true) {
-    Job job = worker->getJob();
-    if (job.function == nullptr) {
-       // Termination request, notify the future.
-      job.future->storeResultUnlocked(nullptr, true);
-      theState()->removeWorkerUnlocked(worker->id());
-      break;
-    }
+  {
+    ObjHolder argumentHolder;
+    ObjHolder resultHolder;
+    while (true) {
+      Job job = worker->getJob();
+      if (job.function == nullptr) {
+        // Termination request, notify the future.
+        job.future->storeResultUnlocked(nullptr, true);
+        theState()->removeWorkerUnlocked(worker->id());
+        break;
+      }
 
-    KRef argument = AdoptStablePointer(job.argument, argumentHolder.slot());
-    KNativePtr result = nullptr;
-    bool ok = true;
-    try {
+      KRef argument = AdoptStablePointer(job.argument, argumentHolder.slot());
+      KNativePtr result = nullptr;
+      bool ok = true;
+      try {
         job.function(argument, resultHolder.slot());
         argumentHolder.clear();
         // Transfer the result.
         result = transfer(resultHolder.obj(), job.transferMode);
-    } catch (ObjHolder& e) {
+      } catch (ObjHolder& e) {
         ok = false;
         if (worker->errorReporting())
             ReportUnhandledException(e.obj());
+      }
+      // Notify the future.
+      job.future->storeResultUnlocked(result, ok);
+      resultHolder.clear();
     }
-    // Notify the future.
-    job.future->storeResultUnlocked(result, ok);
-    resultHolder.clear();
   }
 
   Kotlin_deinitRuntimeIfNeeded();

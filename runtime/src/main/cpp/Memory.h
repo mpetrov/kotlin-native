@@ -140,6 +140,16 @@ struct ContainerHeader {
     return value >> CONTAINER_TAG_SHIFT;
   }
 
+  inline int decRefCount() {
+  #ifdef KONAN_NO_THREADS
+      int value = refCount_ -= CONTAINER_TAG_INCREMENT;
+  #else
+      int value = shareable() ?
+         __sync_sub_and_fetch(&refCount_, CONTAINER_TAG_INCREMENT) : refCount_ -= CONTAINER_TAG_INCREMENT;
+  #endif
+      return value >> CONTAINER_TAG_SHIFT;
+  }
+
   inline unsigned tag() const {
     return refCount_ & CONTAINER_TAG_MASK;
   }
@@ -336,6 +346,8 @@ inline bool PermanentOrFrozen(ObjHeader* obj) {
 
 // Class representing arbitrary placement container.
 class Container {
+ public:
+  ContainerHeader* header() const { return header_; }
  protected:
   // Data where everything is being stored.
   ContainerHeader* header_;
@@ -454,6 +466,8 @@ extern "C" {
     ObjHeader* result = name(__VA_ARGS__, OBJ_RESULT);  \
     return result;                                      \
   }
+#define HEAP_RETURN_SLOT(slot) \
+  (reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(slot) | static_cast<uintptr_t>(HEAP_RETURN_BIT)))
 
 struct MemoryState;
 
@@ -573,10 +587,13 @@ class ObjHolder {
    }
 
    ObjHeader* obj() { return obj_; }
+
    const ObjHeader* obj() const { return obj_; }
+
    ObjHeader** slot() {
      return reinterpret_cast<ObjHeader**>(reinterpret_cast<uintptr_t>(&obj_) | HEAP_RETURN_BIT);
    }
+
    void clear() { ::ZeroHeapRef(&obj_); }
 
   private:
