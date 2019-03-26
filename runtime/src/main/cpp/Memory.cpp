@@ -36,6 +36,8 @@
 #define USE_GC 1
 // Define to 1 to print all memory operations.
 #define TRACE_MEMORY 0
+// Define to 1 to print major GC events.
+#define TRACE_GC 0
 // Collect memory manager events statistics.
 #define COLLECT_STATISTIC 0
 // Auto-adjust GC thresholds.
@@ -52,15 +54,25 @@ constexpr container_size_t kObjectAlignment = 8;
 static_assert(sizeof(ContainerHeader) % kObjectAlignment == 0, "sizeof(ContainerHeader) is not aligned");
 
 #if TRACE_MEMORY
+#undef TRACE_GC
+#define TRACE_GC 1
 #define MEMORY_LOG(...) konan::consolePrintf(__VA_ARGS__);
 #else
 #define MEMORY_LOG(...)
 #endif
 
+#if TRACE_GC
+#define GC_LOG(...) konan::consolePrintf(__VA_ARGS__);
+#else
+#define GC_LOG(...)
+#endif
+
 #if USE_GC
 // Collection threshold default (collect after having so many elements in the
 // release candidates set).
-constexpr size_t kGcThreshold = 4 * 1024;
+constexpr size_t kGcThreshold = 32 * 1024;
+// Threshold of release candidate set.
+constexpr size_t kMaxReleaseSetSize = kGcThreshold;
 #if GC_ERGONOMICS
 // Ergonomic thresholds.
 // If GC to computations time ratio is above that value,
@@ -68,8 +80,6 @@ constexpr size_t kGcThreshold = 4 * 1024;
 constexpr double kGcToComputeRatioThreshold = 0.5;
 // Never exceed this value when increasing GC threshold.
 constexpr size_t kMaxErgonomicThreshold = 1024 * 1024;
-// Threshold of release candidate set.
-constexpr size_t kMaxReleaseSetSize = 32 * 1024;
 #endif  // GC_ERGONOMICS
 
 typedef KStdDeque<ContainerHeader*> ContainerHeaderDeque;
@@ -631,7 +641,6 @@ inline uint32_t freeableSize(MemoryState* state) {
 template <bool Atomic>
 inline void IncrementRC(ContainerHeader* container) {
   container->incRefCount<Atomic>();
-  container->setColorUnlessGreen(CONTAINER_TAG_GC_BLACK);
 }
 
 template <bool Atomic, bool UseCycleCollector>
@@ -651,7 +660,9 @@ inline void DecrementRC(ContainerHeader* container) {
         container->setBuffered();
         auto state = memoryState;
         state->toFree->push_back(container);
-        if (state->gcSuspendCount == 0 && freeableSize(state) >= state->gcThreshold) {
+        GC_LOG("toFree is now %d\n", state->toFree->size());
+        if (state->gcSuspendCount == 0 &&
+            (state->toFree->size() >= state->gcThreshold || state->toRelease->size() >= state->gcThreshold)) {
           GarbageCollect();
         }
       }
@@ -683,17 +694,17 @@ inline void DecrementRC(ContainerHeader* container) {
 template <bool Atomic, bool UseCycleCollector, bool CanCollect>
 inline void EnqueueDecrementRC(ContainerHeader* container) {
   auto state = memoryState;
-  state->toRelease->push_back(container);
   if (CanCollect) {
-    if (state->toRelease->size() > kMaxReleaseSetSize - 16 && state->gcSuspendCount == 0) {
+    if (state->toRelease->size() > kMaxReleaseSetSize - 64 && state->gcSuspendCount == 0) {
       GarbageCollect();
     }
   }
+  state->toRelease->push_back(container);
 }
 
 inline void initThreshold(MemoryState* state, uint32_t gcThreshold) {
   state->gcThreshold = gcThreshold;
-  state->toFree->reserve(gcThreshold);
+  state->toRelease->reserve(gcThreshold);
 }
 #endif // USE_GC
 
@@ -1372,7 +1383,7 @@ OBJ_GETTER(AllocInstance, const TypeInfo* type_info) {
   // We cannot collect until reference will be stored into the stack slot.
   if (header->tag() == CONTAINER_TAG_NORMAL && !isHeapReturnSlot(OBJ_RESULT)) {
     IncrementRC<false>(header);
-    EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ false>(header);
+    EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ true>(header);
   }
   RETURN_OBJ(container.GetPlace());
 }
@@ -1385,7 +1396,7 @@ OBJ_GETTER(AllocArrayInstance, const TypeInfo* type_info, int32_t elements) {
   // We cannot collect until reference will be stored into the stack slot.
   if (header->tag() == CONTAINER_TAG_NORMAL && !isHeapReturnSlot(OBJ_RESULT)) {
     IncrementRC<false>(header);
-    EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ false>(header);
+    EnqueueDecrementRC</* Atomic = */ false, /* UseCyclicCollector = */ true, /* CanCollect = */ true>(header);
   }
   RETURN_OBJ(container.GetPlace()->obj());
 }
@@ -1676,17 +1687,13 @@ void incrementNewlyFrozenOnStack(MemoryState* state, const ContainerHeaderSet* n
 void processDecrements(MemoryState* state) {
   auto* toRelease = state->toRelease;
   state->gcSuspendCount++;
-  auto toReleaseCount = toRelease->size();
-  for (int i = 0; i < toReleaseCount; i++) {
-    auto* it = (*toRelease)[i];
-    if (isMarkedAsRemoved(it))
-        continue;
-    DecrementRC(it);
+  while (toRelease->size() > 0) {
+     auto* container = toRelease->back();
+     toRelease->pop_back();
+     if (isMarkedAsRemoved(container))
+       continue;
+     DecrementRC(container);
   }
-  int newElements = toRelease->size() - toReleaseCount;
-  if (newElements > 0)
-    std::copy(toRelease->begin() + toReleaseCount, toRelease->end(), toRelease->begin());
-  toRelease->resize(newElements);
   state->gcSuspendCount--;
 }
 
@@ -1713,7 +1720,7 @@ void GarbageCollect() {
   MemoryState* state = memoryState;
   RuntimeAssert(!state->gcInProgress, "Recursive GC is disallowed");
 
-  MEMORY_LOG("Garbage collect\n")
+  GC_LOG(">>> GC: toFree %d toRelease %d\n", state->toFree->size(), state->toRelease->size())
 
 #if GC_ERGONOMICS
   auto gcStartTime = konan::getTimeMicros();
@@ -1724,6 +1731,8 @@ void GarbageCollect() {
   incrementStack(state);
   processDecrements(state);
   decrementStack(state);
+
+  GC_LOG("||| GC: toFree %d toRelease %d\n", state->toFree->size(), state->toRelease->size())
 
   processFinalizerQueue(state);
 
@@ -1744,10 +1753,11 @@ void GarbageCollect() {
         initThreshold(state, newThreshold);
      }
   }
-  MEMORY_LOG("Garbage collect: GC length=%lld sinceLast=%lld\n",
-             (gcEndTime - gcStartTime), gcStartTime - state->lastGcTimestamp);
+  GC_LOG("GC: duration=%lld sinceLast=%lld\n", (gcEndTime - gcStartTime), gcStartTime - state->lastGcTimestamp);
   state->lastGcTimestamp = gcEndTime;
 #endif
+
+  GC_LOG("<<< GC: toFree %d toRelease %d\n", state->toFree->size(), state->toRelease->size())
 }
 
 #endif // USE_GC
@@ -1769,8 +1779,7 @@ void Kotlin_native_internal_GC_resume(KRef) {
   MemoryState* state = memoryState;
   if (state->gcSuspendCount > 0) {
     state->gcSuspendCount--;
-    if (state->toFree != nullptr &&
-        freeableSize(state) >= state->gcThreshold) {
+    if (state->toFree != nullptr && freeableSize(state) >= state->gcThreshold) {
       GarbageCollect();
     }
   }
@@ -1781,6 +1790,7 @@ void Kotlin_native_internal_GC_stop(KRef) {
 #if USE_GC
   if (memoryState->toFree != nullptr) {
     GarbageCollect();
+    // TODO: what shall we do with toRelease here? Just leak?
     konanDestructInstance(memoryState->toFree);
     konanDestructInstance(memoryState->roots);
     memoryState->toFree = nullptr;
@@ -1896,7 +1906,7 @@ bool ClearSubgraphReferences(ObjHeader* root, bool checked) {
         auto bad = hasExternalRefs(container, &visited);
         ScanBlack<false>(container);
         if (bad) {
-           // Restore original RC if check failed.
+           // Restore original RC if the check failed.
            for (int i = 0; i < rcDecrement; i++) container->incRefCount<false>();
            return false;
         }
