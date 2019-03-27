@@ -12,7 +12,7 @@ without the need to ship an additional execution runtime.
 
 Prerequisites:
 *   install JDK for your platform, instead of JRE. The build requires ```tools.jar```, which is not included in JRE;
-*   on macOS install Xcode 10.1
+*   on macOS install Xcode 10.2
 *   on Fedora 26+ ```yum install ncurses-compat-libs``` may be needed
 
 To compile from sources use following steps:
@@ -27,7 +27,7 @@ Then, build the compiler and libraries:
 
 To build with experimental targets support compile with `-Porg.jetbrains.kotlin.native.experimentalTargets`.
 
-The build can take about an hour on a Macbook Pro.
+./gradlew dist -PsharedProjectPathThe build can take about an hour on a Macbook Pro.
 To run a shorter build with only the host compiler and libraries, run:
 
     ./gradlew dist distPlatformLibs
